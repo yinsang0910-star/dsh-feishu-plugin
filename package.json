@@ -1,0 +1,49 @@
+{
+  "name": "@dsh-feishu/dsh-plugin",
+  "version": "0.1.0",
+  "type": "module",
+  "description": "DeepSeek Harness 的飞书连接设置页：四步向导 + 扫码创建应用 + 九项自检",
+  "keywords": [
+    "dsh-plugin",
+    "deepseek-harness",
+    "feishu",
+    "lark"
+  ],
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./client": "./client.js",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "dist",
+    "client.js",
+    "cordis.patch.yml",
+    "README.md",
+    "LICENSE"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web"
+    }
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/yinsang0910-star/dsh-feishu-plugin.git"
+  },
+  "homepage": "https://github.com/yinsang0910-star/dsh-feishu",
+  "bugs": {
+    "url": "https://github.com/yinsang0910-star/dsh-feishu/issues"
+  },
+  "license": "MIT",
+  "engines": {
+    "node": ">=20"
+  }
+}

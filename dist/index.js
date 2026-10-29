@@ -1,0 +1,1421 @@
+/**
+ * dsh-feishu 设置页 —— 服务端（Cordis host 半侧）入口。
+ *
+ * 一条具名路由 `POST /dsh-feishu/api` 收三种 op：
+ *   · `status`  读 env 文件 + profile 的 patch 文件，回报当前状态（**永不回传 secret 明文**）
+ *   · `test`    真调飞书 `tenant_access_token` + `im/v1/chats/{id}` 校验凭据
+ *   · `save`    写 `~/.config/dsh/feishu.env`（0600，原子写）+ 幂等维护 profile
+ *               `cordis.patch.yml` 里的 managed block（语义与 scripts/install.mjs 一致，
+ *               但这里自己实现，不 shell 调脚本）
+ *
+ * 加载链路、`inject` 语义、`webServer.register` 形状、来源校验的必要性
+ * 都在同目录 README 里有行号级依据：
+ *   · 服务就绪门槛 → README §5.1（别把不确定的服务名塞进 inject，§5.3）
+ *   · 路由注册 → README §4.1/§4.2（`ctx.effect` 包住以获得自动注销）
+ *   · 来源校验 → README §3.4/§4.3（自挂路由不在 `/api` 的浏览器认证栅栏里）
+ *
+ * 运行期只 import `node:` 内建模块；不 import 任何第三方包。
+ */
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import { createRequire } from 'node:module';
+/**
+ * `qrcode` 只有 CJS 产物、也没装 @types，用 createRequire 拿最省事，
+ * 比为了一个 SVG 生成器再引 @types/qrcode 干净。
+ */
+const nodeRequire = createRequire(import.meta.url);
+const QRCode = nodeRequire('qrcode');
+/** Cordis 里的插件名，用于日志/诊断。 */
+export const name = 'dsh-feishu-settings';
+/** 必需服务：只写确实要用、且在目标 profile 里必然存在的那个。 */
+export const inject = ['webServer'];
+const DEFAULT_PATH = '/dsh-feishu/api';
+const MAX_BODY_BYTES = 64 * 1024;
+/** 本包名（同时也是浏览器 bundle 的 `__ModuleLoader__` id）。 */
+const PACKAGE_NAME = '@dsh-feishu/dsh-plugin';
+const ENV_HEADER = '# dsh-feishu 凭据 —— 由 DSH 的飞书设置页生成，不要提交';
+/**
+ * managed block 的哨兵行，与 scripts/install.mjs 用同一对文案，两边可以互相接手。
+ *
+ * 定位只比**前缀**：括号里的括注是给人看的说明，两边演化速度不一样。曾经整行严格
+ * 比对，install.mjs 写「由 scripts/install.mjs 维护」而插件找「由设置页 / scripts/…」，
+ * 差几个字就 indexOf 落空 —— 明明挂载了却报「未挂载」。文案可以变，标记不能失配。
+ */
+const BLOCK_START_PREFIX = '# >>> dsh-feishu managed block';
+const BLOCK_END_PREFIX = '# <<< dsh-feishu managed block';
+const BLOCK_START = `${BLOCK_START_PREFIX} (由设置页 / scripts/install.mjs 维护，手改会被覆盖)`;
+const BLOCK_END = BLOCK_END_PREFIX;
+/** patch 里那一行 MCP entry 的 id 与它要加载的包（install.mjs:166-167 同款）。 */
+const MCP_ENTRY_ID = 'mcp-feishu';
+const MCP_SERVER_NAME = 'feishu';
+const MCP_CLIENT_PACKAGE = '@deepseek-ai/dsh-mcp-client';
+const FEISHU_ORIGIN = 'https://open.feishu.cn';
+const HTTP_TIMEOUT_MS = 15_000;
+/**
+ * 扫码创建应用的端点。这是飞书官方的 RFC 8628 设备授权流程，
+ * `@larksuiteoapi/node-sdk` 的 `registerApp()` 就是把下面两个 form 打过来：
+ *   action=begin / action=poll
+ * 这里手写而不是引那个 6MB 的 SDK —— 一共两个 POST，参数固定。
+ */
+const REGISTRATION_PATH = '/oauth/v1/app/registration';
+const IS_WINDOWS = process.platform === 'win32';
+/** env 文件里本插件负责的三个键（写入顺序固定）。 */
+const ENV_ORDER = ['FEISHU_APP_ID', 'FEISHU_APP_SECRET', 'FEISHU_DEFAULT_CHAT_ID'];
+/* ──────────────────────────── 错误 ──────────────────────────── */
+/** 带 HTTP 状态码的业务错误：handler 统一映射成 JSON。 */
+class ApiError extends Error {
+    status;
+    constructor(status, message) {
+        super(message);
+        this.status = status;
+        this.name = 'ApiError';
+    }
+}
+/* ──────────────────────────── HTTP 小工具 ──────────────────────────── */
+function sendJson(res, status, body) {
+    const text = JSON.stringify(body);
+    res.writeHead(status, {
+        'content-type': 'application/json; charset=utf-8',
+        'cache-control': 'no-store',
+        'content-length': String(Buffer.byteLength(text)),
+    });
+    res.end(text);
+}
+async function readJson(req) {
+    const chunks = [];
+    let size = 0;
+    for await (const chunk of req) {
+        const buf = chunk;
+        size += buf.length;
+        if (size > MAX_BODY_BYTES)
+            throw new ApiError(413, `请求体超过 ${MAX_BODY_BYTES} 字节`);
+        chunks.push(buf);
+    }
+    const raw = Buffer.concat(chunks).toString('utf8').trim();
+    if (raw === '')
+        return {};
+    try {
+        const parsed = JSON.parse(raw);
+        if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
+            throw new Error('body must be a JSON object');
+        }
+        return parsed;
+    }
+    catch (error) {
+        throw new ApiError(400, `请求体不是合法 JSON：${error instanceof Error ? error.message : String(error)}`);
+    }
+}
+/**
+ * 自定义具名路由不经过 `/api` 的浏览器认证栅栏（那条路由归 client-connection 独占），
+ * 跨源判断必须插件自己做：回环放行，非回环要求 Origin 与 Host 同源。
+ * 这段逻辑（含回环地址白名单）沿用骨架实现，所有 op 都要先过它。
+ */
+function trustedOrigin(req) {
+    const remote = req.socket.remoteAddress;
+    if (remote === '127.0.0.1' || remote === '::1' || remote === '::ffff:127.0.0.1')
+        return true;
+    const host = req.headers.host;
+    if (host === undefined || host === '')
+        return false;
+    const origin = req.headers.origin;
+    if (origin === undefined || origin === '' || origin === 'null')
+        return true;
+    try {
+        return new URL(origin).host === host;
+    }
+    catch {
+        return false;
+    }
+}
+/* ──────────────────────────── 路径 / 文件 ──────────────────────────── */
+function expandTilde(value) {
+    if (value === '~')
+        return os.homedir();
+    if (value.startsWith('~/') || value.startsWith('~\\'))
+        return path.join(os.homedir(), value.slice(2));
+    return value;
+}
+function resolveTargets(config) {
+    const homeDir = typeof config.homeDir === 'string' && config.homeDir !== ''
+        ? expandTilde(config.homeDir)
+        : os.homedir();
+    const envOverride = process.env['DSH_HOME'];
+    const dshHome = typeof config.dshHome === 'string' && config.dshHome !== ''
+        ? expandTilde(config.dshHome)
+        : typeof envOverride === 'string' && envOverride !== ''
+            ? expandTilde(envOverride)
+            : path.join(homeDir, '.dsh');
+    const envPath = typeof config.envPath === 'string' && config.envPath !== ''
+        ? expandTilde(config.envPath)
+        : path.join(homeDir, '.config', 'dsh', 'feishu.env');
+    const profilesRoot = typeof config.profilesRoot === 'string' && config.profilesRoot !== ''
+        ? expandTilde(config.profilesRoot)
+        : path.join(dshHome, 'profiles');
+    const wrapperPath = typeof config.mcpWrapperPath === 'string' && config.mcpWrapperPath !== ''
+        ? expandTilde(config.mcpWrapperPath)
+        : path.join(homeDir, '.local', 'bin', IS_WINDOWS ? 'dsh-feishu-mcp.cmd' : 'dsh-feishu-mcp');
+    return { homeDir, dshHome, envPath, profilesRoot, wrapperPath };
+}
+function ensureDir(dir) {
+    fs.mkdirSync(dir, { recursive: true });
+}
+function readTextOrNull(file) {
+    try {
+        return fs.readFileSync(file, 'utf8');
+    }
+    catch {
+        return null;
+    }
+}
+function statOrNull(file) {
+    try {
+        return fs.statSync(file);
+    }
+    catch {
+        return null;
+    }
+}
+/**
+ * 原子写：先写同目录 `.tmp` 再 rename 覆盖，避免半截文件。
+ * rename 失败（Windows 上目标被占用 / AV 锁）时退化为 copy + 清理临时文件。
+ */
+function atomicWriteFile(file, text, mode) {
+    ensureDir(path.dirname(file));
+    const tmp = `${file}.tmp-${process.pid.toString(36)}-${Date.now().toString(36)}`;
+    fs.writeFileSync(tmp, text, { encoding: 'utf8', mode });
+    try {
+        fs.chmodSync(tmp, mode);
+    }
+    catch {
+        /* Windows 上 chmod 只影响只读位，尽力而为 */
+    }
+    try {
+        fs.renameSync(tmp, file);
+    }
+    catch (renameError) {
+        try {
+            fs.copyFileSync(tmp, file);
+        }
+        catch {
+            fs.rmSync(tmp, { force: true });
+            throw renameError;
+        }
+        fs.rmSync(tmp, { force: true });
+    }
+    try {
+        fs.chmodSync(file, mode);
+    }
+    catch {
+        /* 同上 */
+    }
+}
+/* ──────────────────────────── env 文件 ──────────────────────────── */
+function parseEnvText(text) {
+    const out = new Map();
+    for (const line of text.split(/\r?\n/)) {
+        const trimmed = line.trim();
+        if (trimmed === '' || trimmed.startsWith('#'))
+            continue;
+        const eq = trimmed.indexOf('=');
+        if (eq <= 0)
+            continue;
+        const key = trimmed.slice(0, eq).trim();
+        if (key === '')
+            continue;
+        let value = trimmed.slice(eq + 1).trim();
+        const quoted = (value.startsWith('"') && value.endsWith('"') && value.length >= 2) ||
+            (value.startsWith("'") && value.endsWith("'") && value.length >= 2);
+        if (quoted)
+            value = value.slice(1, -1);
+        out.set(key, value);
+    }
+    return out;
+}
+function renderEnvText(values) {
+    const lines = [ENV_HEADER];
+    const handled = new Set();
+    for (const key of ENV_ORDER) {
+        handled.add(key);
+        const value = values.get(key);
+        if (value !== undefined && value !== '')
+            lines.push(`${key}=${value}`);
+    }
+    const rest = [...values.keys()].filter((key) => !handled.has(key)).sort();
+    const extra = [];
+    for (const key of rest) {
+        const value = values.get(key);
+        if (value !== undefined && value !== '')
+            extra.push(`${key}=${value}`);
+    }
+    if (extra.length > 0)
+        lines.push('', ...extra);
+    return `${lines.join('\n')}\n`;
+}
+function readEnvSnapshot(envPath) {
+    const text = readTextOrNull(envPath);
+    const values = text === null ? new Map() : parseEnvText(text);
+    const secret = values.get('FEISHU_APP_SECRET') ?? '';
+    const stat = text === null ? null : statOrNull(envPath);
+    const fileMode = stat === null ? null : (stat.mode & 0o777).toString(8);
+    return {
+        path: envPath,
+        exists: text !== null,
+        appId: values.get('FEISHU_APP_ID') ?? null,
+        chatId: values.get('FEISHU_DEFAULT_CHAT_ID') ?? null,
+        hasSecret: secret !== '',
+        secretTail: secret.length >= 4 ? secret.slice(-4) : secret === '' ? null : `**${secret}`,
+        fileMode,
+        modeApplied: stat === null ? false : IS_WINDOWS ? true : (stat.mode & 0o777) === 0o600,
+        values,
+    };
+}
+/* ──────────────────────────── profile / patch ──────────────────────────── */
+/** profile 名只允许出现在 profiles 根目录的一层里，挡住请求里塞进来的 `../`。 */
+function validateProfileName(name) {
+    if (!/^[A-Za-z0-9._-]+$/.test(name))
+        return 'profile 名只能包含字母、数字、点、下划线、连字符';
+    if (name === '.' || name.startsWith('..'))
+        return 'profile 名不合法（不允许 . 或 .. 开头）';
+    return null;
+}
+function listProfiles(profilesRoot) {
+    let entries;
+    try {
+        entries = fs.readdirSync(profilesRoot, { withFileTypes: true });
+    }
+    catch {
+        return [];
+    }
+    return entries
+        .filter((entry) => entry.isDirectory() || entry.isSymbolicLink())
+        .map((entry) => entry.name)
+        .filter((entry) => entry !== 'node_modules' && !entry.startsWith('.'))
+        .sort();
+}
+/** 这个 profile 目录里有没有任何痕迹指向本包（说明它就是"我们的" profile）。 */
+function profileMentionsUs(profileDir) {
+    const pkgScopePath = path.join(profileDir, 'node_modules', ...PACKAGE_NAME.split('/'));
+    if (statOrNull(pkgScopePath) !== null)
+        return true;
+    const patchText = readTextOrNull(path.join(profileDir, 'cordis.patch.yml'));
+    if (patchText !== null && (patchText.includes(PACKAGE_NAME) || patchText.includes(BLOCK_START_PREFIX))) {
+        return true;
+    }
+    const manifestText = readTextOrNull(path.join(profileDir, 'package.json'));
+    if (manifestText !== null && manifestText.includes(PACKAGE_NAME))
+        return true;
+    return false;
+}
+/**
+ * 当前 profile 探测（按可靠性从高到低）：
+ *   1. config.profileDir / config.profile（patch 里能写死，最确定）
+ *   2. env.DSH_PROFILE / env.DSH_PROFILE_NAME
+ *   3. `process.argv` 里的 `--profile <name>`
+ *   4. 本模块 URL 里的 `profiles/<name>/` 段（junction 安装时可能已被 realpath 化）
+ *   5. `$DSH_HOME/profiles/*` 里唯一提到本包的那个；都没有时若只有一个 profile 就用它
+ * 探测不出来时返回 null，让 op 报出明确原因，绝不瞎猜着写别人的配置。
+ */
+function resolveProfile(config, targets) {
+    const candidates = listProfiles(targets.profilesRoot);
+    if (typeof config.profileDir === 'string' && config.profileDir !== '') {
+        const dir = expandTilde(config.profileDir);
+        return { name: path.basename(dir), dir, source: 'config.profileDir', candidates };
+    }
+    if (typeof config.profile === 'string' && config.profile !== '') {
+        return {
+            name: config.profile,
+            dir: path.join(targets.profilesRoot, config.profile),
+            source: 'config.profile',
+            candidates,
+        };
+    }
+    for (const key of ['DSH_PROFILE', 'DSH_PROFILE_NAME']) {
+        const value = process.env[key];
+        if (typeof value === 'string' && value !== '') {
+            return { name: value, dir: path.join(targets.profilesRoot, value), source: `env.${key}`, candidates };
+        }
+    }
+    const argv = process.argv;
+    for (let index = 0; index < argv.length; index += 1) {
+        const arg = argv[index];
+        if (arg === '--profile') {
+            const next = argv[index + 1];
+            if (typeof next === 'string' && next !== '' && !next.startsWith('-')) {
+                return { name: next, dir: path.join(targets.profilesRoot, next), source: 'argv', candidates };
+            }
+        }
+        if (typeof arg === 'string' && arg.startsWith('--profile=')) {
+            const value = arg.slice('--profile='.length);
+            if (value !== '') {
+                return { name: value, dir: path.join(targets.profilesRoot, value), source: 'argv', candidates };
+            }
+        }
+    }
+    const moduleUrl = safeModuleUrl();
+    if (moduleUrl !== null) {
+        const segments = moduleUrl.split(/[\\/]+/);
+        const index = segments.lastIndexOf('profiles');
+        const name = index >= 0 ? segments[index + 1] : undefined;
+        if (typeof name === 'string' && name !== '' && name !== 'node_modules') {
+            return { name, dir: path.join(targets.profilesRoot, name), source: 'module-path', candidates };
+        }
+    }
+    const mentioned = candidates.filter((candidate) => profileMentionsUs(path.join(targets.profilesRoot, candidate)));
+    if (mentioned.length === 1) {
+        const only = mentioned[0];
+        return { name: only, dir: path.join(targets.profilesRoot, only), source: 'scan', candidates };
+    }
+    if (mentioned.length === 0 && candidates.length === 1) {
+        const only = candidates[0];
+        return { name: only, dir: path.join(targets.profilesRoot, only), source: 'single', candidates };
+    }
+    return {
+        name: null,
+        dir: null,
+        source: mentioned.length > 1 ? 'ambiguous' : 'unresolved',
+        candidates,
+    };
+}
+function safeModuleUrl() {
+    try {
+        const url = import.meta.url;
+        if (typeof url !== 'string' || url === '')
+            return null;
+        return decodeURIComponent(url.replace(/^file:\/\/\/?/, ''));
+    }
+    catch {
+        return null;
+    }
+}
+/** managed block 文本生成（结构与 install.mjs:161-183 逐行对齐）。 */
+function renderManagedBlock(wrapperPath) {
+    const lines = [
+        BLOCK_START,
+        '- insert:',
+        `    - id: ${MCP_ENTRY_ID}`,
+        `      name: '${MCP_CLIENT_PACKAGE}'`,
+        '      config:',
+        `        serverName: ${MCP_SERVER_NAME}`,
+        '        transport: stdio',
+    ];
+    if (IS_WINDOWS) {
+        lines.push('        command: cmd');
+        lines.push(`        args: ['/c', ${JSON.stringify(wrapperPath)}]`);
+    }
+    else {
+        lines.push(`        command: ${JSON.stringify(wrapperPath)}`);
+        lines.push('        args: []');
+    }
+    lines.push('        toolCallTimeoutMs: 660000');
+    lines.push('        failOnStartupError: false');
+    lines.push(BLOCK_END);
+    return lines.join('\n');
+}
+/** 按行找哨兵，返回块在原文里的字符区间（含两端哨兵行）。 */
+function locateManagedBlock(text) {
+    let offset = 0;
+    let start = -1;
+    for (const line of text.split('\n')) {
+        const marker = line.trim();
+        if (start < 0) {
+            if (marker.startsWith(BLOCK_START_PREFIX))
+                start = offset;
+        }
+        else if (marker.startsWith(BLOCK_END_PREFIX)) {
+            return { start, end: offset + line.length };
+        }
+        offset += line.length + 1;
+    }
+    return null;
+}
+function extractManagedBlock(text) {
+    const bounds = locateManagedBlock(text);
+    if (bounds === null)
+        return null;
+    return text.slice(bounds.start, bounds.end);
+}
+function readPatchSnapshot(patchPath) {
+    const text = readTextOrNull(patchPath);
+    if (text === null)
+        return { path: patchPath, exists: false, hasBlock: false, mcpMounted: false };
+    const block = extractManagedBlock(text);
+    return {
+        path: patchPath,
+        exists: true,
+        hasBlock: block !== null,
+        mcpMounted: block !== null && block.includes(`- id: ${MCP_ENTRY_ID}`),
+    };
+}
+/**
+ * 幂等写入 managed block：
+ *   已有 → 原位替换；没有 → 去掉 `[]` 占位后追加；内容已经一致 → 不动文件。
+ */
+function applyManagedBlock(original, block) {
+    const bounds = locateManagedBlock(original);
+    if (bounds !== null) {
+        const current = original.slice(bounds.start, bounds.end);
+        if (current === block)
+            return { text: original, mode: 'unchanged' };
+        const before = original.slice(0, bounds.start);
+        const after = original.slice(bounds.end);
+        return { text: `${before.trimEnd()}\n${block}${after}`, mode: 'updated' };
+    }
+    const stripped = original.replace(/^\s*\[\s*\]\s*$/m, '').trimEnd();
+    return { text: stripped === '' ? `${block}\n` : `${stripped}\n\n${block}\n`, mode: 'created' };
+}
+/**
+ * 按需补写 MCP 启动包装（与 scripts/install.mjs 同款内容）：它只把凭据文件 source 进环境，
+ * 自身**不含 secret**。已存在就绝不覆盖（那是用户的东西）；入口脚本不在就只跳过并说明。
+ */
+function ensureWrapper(targets) {
+    if (statOrNull(targets.wrapperPath) !== null) {
+        return { path: targets.wrapperPath, written: false, skipped: null };
+    }
+    const entryPath = path.join(path.dirname(targets.wrapperPath), 'dsh-feishu-mcp.mjs');
+    if (statOrNull(entryPath) === null) {
+        return {
+            path: targets.wrapperPath,
+            written: false,
+            skipped: `同目录下的 ${path.basename(entryPath)} 不存在，所以没有生成启动包装`,
+        };
+    }
+    const content = IS_WINDOWS
+        ? [
+            '@echo off',
+            'rem dsh-feishu MCP 启动包装：凭据从 feishu.env 读，不落进任何 YAML',
+            `for /f "usebackq tokens=1,* delims==" %%a in ("${targets.envPath}") do set "%%a=%%b"`,
+            `node "${entryPath}"`,
+            '',
+        ].join('\r\n')
+        : [
+            '#!/usr/bin/env bash',
+            '# dsh-feishu MCP 启动包装：凭据从 feishu.env 读，不落进任何 YAML',
+            'set -a',
+            `. "${targets.envPath}"`,
+            'set +a',
+            `exec "${process.execPath}" "${entryPath}"`,
+            '',
+        ].join('\n');
+    atomicWriteFile(targets.wrapperPath, content, IS_WINDOWS ? 0o644 : 0o755);
+    return { path: targets.wrapperPath, written: true, skipped: null };
+}
+function pickFetch() {
+    const candidate = globalThis.fetch;
+    if (typeof candidate !== 'function') {
+        throw new ApiError(500, '当前 Node 运行时不提供 fetch（需要 Node 18+），无法校验飞书凭据');
+    }
+    return candidate;
+}
+function asRecord(value) {
+    return value !== null && typeof value === 'object' && !Array.isArray(value)
+        ? value
+        : null;
+}
+function asString(value) {
+    return typeof value === 'string' && value !== '' ? value : null;
+}
+function asNumber(value) {
+    return typeof value === 'number' && Number.isFinite(value) ? value : null;
+}
+async function httpJson(url, init) {
+    const doFetch = pickFetch();
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), HTTP_TIMEOUT_MS);
+    try {
+        const response = await doFetch(url, { ...init, signal: controller.signal });
+        const text = await response.text();
+        let json = null;
+        try {
+            json = asRecord(JSON.parse(text));
+        }
+        catch {
+            json = null;
+        }
+        return { status: response.status, json, text };
+    }
+    catch (error) {
+        if (error instanceof Error && error.name === 'AbortError') {
+            throw new ApiError(504, `请求飞书超时（${HTTP_TIMEOUT_MS} ms）`);
+        }
+        throw new ApiError(502, `连不上飞书开放平台：${error instanceof Error ? error.message : String(error)}`);
+    }
+    finally {
+        clearTimeout(timer);
+    }
+}
+function feishuOrigin(values) {
+    const domain = values.get('FEISHU_DOMAIN') ?? values.get('LARK_DOMAIN') ?? '';
+    const trimmed = domain.trim().replace(/\/+$/, '');
+    if (trimmed === '')
+        return FEISHU_ORIGIN;
+    return trimmed.startsWith('http') ? trimmed : `https://${trimmed}`;
+}
+async function fetchTenantToken(origin, appId, appSecret) {
+    const result = await httpJson(`${origin}/open-apis/auth/v3/tenant_access_token/internal`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json; charset=utf-8' },
+        body: JSON.stringify({ app_id: appId, app_secret: appSecret }),
+    });
+    const json = result.json;
+    if (json === null) {
+        return { ok: false, code: null, msg: `飞书返回了非 JSON 响应（HTTP ${result.status}）` };
+    }
+    const token = asString(json['tenant_access_token']);
+    const code = asNumber(json['code']);
+    if (token === null || (code !== null && code !== 0)) {
+        return {
+            ok: false,
+            code,
+            msg: asString(json['msg']) ?? asString(json['error']) ?? '未知错误',
+        };
+    }
+    return { ok: true, value: { token, expire: asNumber(json['expire']) } };
+}
+async function fetchChatName(origin, token, chatId) {
+    const result = await httpJson(`${origin}/open-apis/im/v1/chats/${encodeURIComponent(chatId)}`, { method: 'GET', headers: { Authorization: `Bearer ${token}` } });
+    const json = result.json;
+    if (json === null) {
+        return { ok: false, name: null, code: null, msg: `飞书返回了非 JSON 响应（HTTP ${result.status}）` };
+    }
+    const code = asNumber(json['code']);
+    if (code !== null && code !== 0) {
+        return { ok: false, name: null, code, msg: asString(json['msg']) ?? '未知错误' };
+    }
+    const data = asRecord(json['data']);
+    const name = data === null ? null : asString(data['name']);
+    return { ok: true, name, code: 0, msg: null };
+}
+async function listBotChats(origin, token) {
+    const result = await httpJson(`${origin}/open-apis/im/v1/chats?page_size=100`, {
+        method: 'GET',
+        headers: { Authorization: `Bearer ${token}` },
+    });
+    const json = result.json;
+    if (json === null) {
+        return {
+            ok: false,
+            chats: [],
+            hasMore: false,
+            code: null,
+            msg: `飞书返回了非 JSON 响应（HTTP ${result.status}）`,
+        };
+    }
+    const code = asNumber(json['code']);
+    if (code !== null && code !== 0) {
+        return { ok: false, chats: [], hasMore: false, code, msg: asString(json['msg']) ?? '未知错误' };
+    }
+    const data = asRecord(json['data']);
+    const items = data === null ? null : data['items'];
+    const chats = [];
+    if (Array.isArray(items)) {
+        for (const raw of items) {
+            const item = asRecord(raw);
+            if (item === null)
+                continue;
+            const chatId = asString(item['chat_id']);
+            if (chatId === null)
+                continue;
+            chats.push({
+                chatId,
+                name: asString(item['name']),
+                description: asString(item['description']),
+                userCount: asNumber(item['user_count']),
+                chatMode: asString(item['chat_mode']),
+                external: item['external'] === true,
+            });
+        }
+    }
+    return {
+        ok: true,
+        chats,
+        hasMore: data !== null && data['has_more'] === true,
+        code: 0,
+        msg: null,
+    };
+}
+function checkItem(id, label, status, detail, scope = null) {
+    return { id, label, status, detail, scope };
+}
+/** multipart 只需要 ASCII（boundary、头、探测文件名与内容），不引 TextEncoder 以免 lib 依赖。 */
+function asciiBytes(text) {
+    const out = new Uint8Array(text.length);
+    for (let i = 0; i < text.length; i += 1) {
+        out[i] = text.charCodeAt(i) & 0xff;
+    }
+    return out;
+}
+function buildMultipart(fields, file) {
+    const boundary = `----dshfeishu${Date.now().toString(16)}`;
+    const chunks = [];
+    for (const field of fields) {
+        chunks.push(asciiBytes(`--${boundary}\r\nContent-Disposition: form-data; name="${field.name}"\r\n\r\n${field.value}\r\n`));
+    }
+    chunks.push(asciiBytes(`--${boundary}\r\nContent-Disposition: form-data; name="${file.name}"; filename="${file.filename}"\r\nContent-Type: ${file.contentType}\r\n\r\n`));
+    chunks.push(file.data);
+    chunks.push(asciiBytes(`\r\n--${boundary}--\r\n`));
+    let total = 0;
+    for (const chunk of chunks)
+        total += chunk.length;
+    const body = new Uint8Array(total);
+    let offset = 0;
+    for (const chunk of chunks) {
+        body.set(chunk, offset);
+        offset += chunk.length;
+    }
+    return { body, contentType: `multipart/form-data; boundary=${boundary}` };
+}
+function probeFailure(json, status) {
+    if (json === null) {
+        return { ok: false, code: null, msg: `非 JSON 响应（HTTP ${status}）`, extra: null };
+    }
+    return {
+        ok: false,
+        code: asNumber(json['code']),
+        msg: asString(json['msg']) ?? asString(json['error']) ?? '未知错误',
+        extra: null,
+    };
+}
+/** 探机器人身份：/bot/v3/info 的 bot 在响应顶层，不在 data 里。 */
+async function probeBotInfo(origin, token) {
+    const result = await httpJson(`${origin}/open-apis/bot/v3/info`, {
+        method: 'GET',
+        headers: { Authorization: `Bearer ${token}` },
+    });
+    const json = result.json;
+    const code = json === null ? null : asNumber(json['code']);
+    if (json === null || (code !== null && code !== 0)) {
+        return probeFailure(json, result.status);
+    }
+    const bot = asRecord(json['bot']);
+    return {
+        ok: true,
+        code: 0,
+        msg: null,
+        extra: bot === null ? null : asString(bot['app_name']),
+    };
+}
+/** 读一行历史：验证 im:message 读权限，且不往群里发任何东西。 */
+async function probeChatHistory(origin, token, chatId) {
+    const result = await httpJson(`${origin}/open-apis/im/v1/messages?container_id_type=chat&container_id=${encodeURIComponent(chatId)}&page_size=1&sort_type=ByCreateTimeDesc`, { method: 'GET', headers: { Authorization: `Bearer ${token}` } });
+    const json = result.json;
+    const code = json === null ? null : asNumber(json['code']);
+    if (json === null || (code !== null && code !== 0)) {
+        return probeFailure(json, result.status);
+    }
+    const data = asRecord(json['data']);
+    const items = data === null ? null : data['items'];
+    const count = Array.isArray(items) ? items.length : 0;
+    return { ok: true, code: 0, msg: null, extra: `读到 ${count} 条` };
+}
+/** 上传一个 20 字节探测文件：只为验证 im:resource 写权限，不上传就不发消息、群里无痕。 */
+async function probeFileUpload(origin, token) {
+    const multipart = buildMultipart([{ name: 'file_type', value: 'stream' }], {
+        name: 'file',
+        filename: 'dsh-feishu-selftest.txt',
+        contentType: 'text/plain',
+        data: asciiBytes('dsh-feishu selftest'),
+    });
+    const result = await httpJson(`${origin}/open-apis/im/v1/files`, {
+        method: 'POST',
+        headers: {
+            Authorization: `Bearer ${token}`,
+            'Content-Type': multipart.contentType,
+        },
+        body: multipart.body,
+    });
+    const json = result.json;
+    const code = json === null ? null : asNumber(json['code']);
+    if (json === null || (code !== null && code !== 0)) {
+        return probeFailure(json, result.status);
+    }
+    const data = asRecord(json['data']);
+    const fileKey = data === null ? null : asString(data['file_key']);
+    return { ok: true, code: 0, msg: null, extra: fileKey === null ? null : `file_key ${fileKey.slice(0, 18)}…` };
+}
+async function probeDrive(origin, token) {
+    const result = await httpJson(`${origin}/open-apis/drive/v1/files?page_size=1`, {
+        method: 'GET',
+        headers: { Authorization: `Bearer ${token}` },
+    });
+    const json = result.json;
+    const code = json === null ? null : asNumber(json['code']);
+    if (json === null || (code !== null && code !== 0)) {
+        return probeFailure(json, result.status);
+    }
+    const data = asRecord(json['data']);
+    const files = data === null ? null : data['files'];
+    const count = Array.isArray(files) ? files.length : 0;
+    return { ok: true, code: 0, msg: null, extra: `根目录 ${count} 项` };
+}
+/** 飞书权限错误码：99991672 = 缺 scope，230027 = 缺群消息读权限，230001 = 会话不存在/不在群里。 */
+const SCOPE_ERROR_CODES = new Set([99991672, 99991663, 230027]);
+function failureScope(result) {
+    return result.code !== null && SCOPE_ERROR_CODES.has(result.code) ? '__scope__' : null;
+}
+/* ──────────────────────────── op 实现 ──────────────────────────── */
+function statusReport(config, targets) {
+    const env = readEnvSnapshot(targets.envPath);
+    const resolved = resolveProfile(config, targets);
+    const patchPath = resolved.dir === null ? null : path.join(resolved.dir, 'cordis.patch.yml');
+    const patch = patchPath === null
+        ? { path: '', exists: false, hasBlock: false, mcpMounted: false }
+        : readPatchSnapshot(patchPath);
+    const wrapperExists = statOrNull(targets.wrapperPath) !== null;
+    const hints = [];
+    if (!env.exists) {
+        hints.push(`还没有凭据文件（${targets.envPath}）：填好下面三项后点「保存并启用」。`);
+    }
+    else if (env.appId === null || !env.hasSecret) {
+        hints.push('凭据文件存在但缺 App ID 或 App Secret，请补全后再保存。');
+    }
+    if (resolved.name === null) {
+        hints.push(`探测不出当前 profile（候选：${resolved.candidates.join('、') || '无'}）：请在下面手动选择目标 profile，或在 patch 的 config 里写死 profile。`);
+    }
+    if (patch.mcpMounted) {
+        hints.push('MCP 已挂进 patch：重启 DSH 后才会真正连上飞书。');
+    }
+    else if (resolved.name !== null) {
+        hints.push('MCP 还没挂进 patch：点「保存并启用」会幂等写入。');
+    }
+    if (!wrapperExists) {
+        const entryExists = statOrNull(path.join(path.dirname(targets.wrapperPath), 'dsh-feishu-mcp.mjs')) !== null;
+        hints.push(entryExists
+            ? `MCP 启动包装不存在（${targets.wrapperPath}）：点「保存并启用」会按需补写（它只 source 凭据文件）。`
+            : `MCP 启动包装和入口脚本都不在（${path.dirname(targets.wrapperPath)}）：先把 dist-single/dsh-feishu-mcp.mjs 拷进去，或跑 node scripts/install.mjs。`);
+    }
+    if (IS_WINDOWS) {
+        hints.push('Windows 上 chmod 只影响只读位，0600 由用户目录的 NTFS ACL 承担。');
+    }
+    return {
+        ok: true,
+        op: 'status',
+        configured: env.exists && env.appId !== null && env.hasSecret,
+        env: {
+            path: env.path,
+            exists: env.exists,
+            appId: env.appId,
+            chatId: env.chatId,
+            hasSecret: env.hasSecret,
+            secretTail: env.secretTail,
+            fileMode: env.fileMode,
+            modeApplied: env.modeApplied,
+        },
+        profile: {
+            name: resolved.name,
+            source: resolved.source,
+            dir: resolved.dir,
+            patchPath: patch.path === '' ? null : patch.path,
+            patchExists: patch.exists,
+            managedBlock: patch.hasBlock,
+            mcpMounted: patch.mcpMounted,
+            wrapperPath: targets.wrapperPath,
+            wrapperExists,
+        },
+        profiles: resolved.candidates,
+        dshHome: targets.dshHome,
+        hints,
+    };
+}
+function pickString(body, key) {
+    const value = body[key];
+    if (typeof value !== 'string')
+        return null;
+    const trimmed = value.trim();
+    return trimmed === '' ? null : trimmed;
+}
+function credentialsForTest(body, env) {
+    const appId = pickString(body, 'appId') ?? env.appId;
+    const appSecret = pickString(body, 'appSecret') ?? (env.hasSecret ? (env.values.get('FEISHU_APP_SECRET') ?? null) : null);
+    const chatId = typeof body['chatId'] === 'string'
+        ? (body['chatId'].trim() === '' ? null : body['chatId'].trim())
+        : env.chatId;
+    return { appId, appSecret, chatId, origin: feishuOrigin(env.values) };
+}
+async function runTest(ctx, body, targets) {
+    const env = readEnvSnapshot(targets.envPath);
+    const credentials = credentialsForTest(body, env);
+    if (credentials.appId === null) {
+        return { ok: false, op: 'test', error: '缺少 App ID：表单里没填，env 文件里也没有' };
+    }
+    if (credentials.appSecret === null) {
+        return {
+            ok: false,
+            op: 'test',
+            error: '缺少 App Secret：表单里留空时要求 env 文件里已经存过一份',
+        };
+    }
+    ctx.logger.info('[dsh-feishu] test · app=%s · chat=%s', credentials.appId, credentials.chatId ?? '(默认会话未设置)');
+    const tokenResult = await fetchTenantToken(credentials.origin, credentials.appId, credentials.appSecret);
+    if (!tokenResult.ok) {
+        return {
+            ok: false,
+            op: 'test',
+            stage: 'credentials',
+            credentialsValid: false,
+            error: `凭据无效：code=${tokenResult.code ?? '未知'} msg=${tokenResult.msg}`,
+            feishu: { code: tokenResult.code, msg: tokenResult.msg },
+        };
+    }
+    if (credentials.chatId === null) {
+        return {
+            ok: true,
+            op: 'test',
+            stage: 'credentials',
+            credentialsValid: true,
+            chat: { requested: false, ok: false, name: null, code: null, msg: null },
+            tokenExpiresInSeconds: tokenResult.value.expire,
+            message: '凭据有效；默认会话还没设置（可选：填 chat_id 后再测一次）',
+        };
+    }
+    const chat = await fetchChatName(credentials.origin, tokenResult.value.token, credentials.chatId);
+    if (!chat.ok) {
+        return {
+            ok: true,
+            op: 'test',
+            stage: 'chat',
+            credentialsValid: true,
+            chat: {
+                requested: true,
+                ok: false,
+                name: null,
+                code: chat.code,
+                msg: chat.msg,
+            },
+            warning: chat.code === 230027 || chat.code === 230001
+                ? '机器人可能没被拉进这个群'
+                : '凭据有效，但这个 chat_id 查不到',
+            message: `凭据有效；默认会话校验失败（code=${chat.code ?? '未知'} msg=${chat.msg ?? ''}）`,
+        };
+    }
+    return {
+        ok: true,
+        op: 'test',
+        stage: 'chat',
+        credentialsValid: true,
+        chat: { requested: true, ok: true, name: chat.name, code: 0, msg: null },
+        tokenExpiresInSeconds: tokenResult.value.expire,
+        message: `凭据有效；默认会话是「${chat.name ?? '(无名)'}」`,
+    };
+}
+async function runSave(ctx, body, config, targets) {
+    const env = readEnvSnapshot(targets.envPath);
+    const bodyAppId = pickString(body, 'appId');
+    const bodySecret = pickString(body, 'appSecret');
+    const appId = bodyAppId ?? env.appId;
+    const appSecret = bodySecret ?? (env.hasSecret ? (env.values.get('FEISHU_APP_SECRET') ?? null) : null);
+    if (appId === null) {
+        return { ok: false, op: 'save', error: '缺少 App ID：请填写飞书开放平台的 App ID（cli_ 开头）' };
+    }
+    if (appSecret === null) {
+        return {
+            ok: false,
+            op: 'save',
+            error: '缺少 App Secret：表单留空时要求 env 文件里已经存过一份',
+        };
+    }
+    // 先解析目标，避免「env 写完了但 patch 找不到地方写」这种半成功状态。
+    const overrideProfile = pickString(body, 'profile');
+    if (overrideProfile !== null) {
+        const problem = validateProfileName(overrideProfile);
+        if (problem !== null) {
+            return { ok: false, op: 'save', stage: 'resolve-profile', error: problem, profiles: listProfiles(targets.profilesRoot) };
+        }
+    }
+    const effectiveConfig = overrideProfile === null ? config : { ...config, profile: overrideProfile, profileDir: undefined };
+    const resolved = resolveProfile(effectiveConfig, targets);
+    if (resolved.dir === null) {
+        return {
+            ok: false,
+            op: 'save',
+            stage: 'resolve-profile',
+            error: resolved.source === 'ambiguous'
+                ? `检测到多个候选 profile（${resolved.candidates.join('、')}），无法确定往哪一个写 patch`
+                : `找不到当前 profile 目录（profiles 根：${targets.profilesRoot}）`,
+            profiles: resolved.candidates,
+            hint: '在请求里带 profile 字段，或在 patch 的 config 里写死 profile。',
+        };
+    }
+    let chatId;
+    if (typeof body['chatId'] === 'string') {
+        const trimmed = body['chatId'].trim();
+        chatId = trimmed === '' ? null : trimmed;
+    }
+    else {
+        chatId = env.chatId;
+    }
+    const nextValues = new Map(env.values);
+    nextValues.set('FEISHU_APP_ID', appId);
+    nextValues.set('FEISHU_APP_SECRET', appSecret);
+    if (chatId === null)
+        nextValues.delete('FEISHU_DEFAULT_CHAT_ID');
+    else
+        nextValues.set('FEISHU_DEFAULT_CHAT_ID', chatId);
+    const envText = renderEnvText(nextValues);
+    const envCreated = !env.exists;
+    atomicWriteFile(targets.envPath, envText, 0o600);
+    ctx.logger.info('[dsh-feishu] 已写入凭据文件 %s（0600）', targets.envPath);
+    const patchPath = path.join(resolved.dir, 'cordis.patch.yml');
+    const block = renderManagedBlock(targets.wrapperPath);
+    const original = readTextOrNull(patchPath);
+    let backup = null;
+    let mode = 'created';
+    try {
+        if (original === null) {
+            atomicWriteFile(patchPath, `${block}\n`, 0o644);
+            mode = 'created';
+        }
+        else {
+            const applied = applyManagedBlock(original, block);
+            mode = applied.mode;
+            if (applied.mode !== 'unchanged') {
+                backup = `${patchPath}.bak-feishu-${Date.now()}`;
+                fs.copyFileSync(patchPath, backup);
+                atomicWriteFile(patchPath, applied.text, 0o644);
+            }
+        }
+    }
+    catch (error) {
+        return {
+            ok: false,
+            op: 'save',
+            stage: 'patch',
+            error: `凭据已保存，但改 patch 失败：${error instanceof Error ? error.message : String(error)}`,
+            envWritten: true,
+            envPath: targets.envPath,
+            patchPath,
+        };
+    }
+    const patchSnapshot = readPatchSnapshot(patchPath);
+    const wrapper = ensureWrapper(targets);
+    const warnings = [];
+    if (wrapper.written) {
+        warnings.push('已顺带写好 MCP 启动包装（只 source 凭据文件，不含 secret）。');
+    }
+    else if (wrapper.skipped !== null) {
+        warnings.push(`${wrapper.path} 没有生成：${wrapper.skipped}。先跑 node scripts/install.mjs，或把 dist-single/dsh-feishu-mcp.mjs 拷到该目录。`);
+    }
+    if (IS_WINDOWS) {
+        warnings.push('Windows 上 0600 由 NTFS ACL 承担（chmod 只影响只读位）。');
+    }
+    warnings.push('MCP 挂载是新加的：重启 DSH 后才会出现 mcp__feishu__* 工具。');
+    ctx.logger.info('[dsh-feishu] patch %s → %s（%s）', patchPath, mode, resolved.source);
+    return {
+        ok: true,
+        op: 'save',
+        env: {
+            path: targets.envPath,
+            created: envCreated,
+            mode: '0600',
+            modeApplied: IS_WINDOWS ? true : readEnvSnapshot(targets.envPath).modeApplied,
+            hasSecret: true,
+            secretTail: appSecret.slice(-4),
+        },
+        patch: {
+            path: patchPath,
+            profile: resolved.name,
+            source: resolved.source,
+            mode,
+            backup,
+            managedBlock: patchSnapshot.hasBlock,
+            mcpMounted: patchSnapshot.mcpMounted,
+        },
+        wrapper: { path: wrapper.path, written: wrapper.written, skipped: wrapper.skipped },
+        warnings,
+        restartRequired: mode !== 'unchanged',
+        message: mode === 'unchanged' ? '凭据已更新；patch 里那一块本来就和现在一致。' : '已保存。重启 DSH 后生效。',
+    };
+}
+/**
+ * 一次扫码尝试：device_code 留在后端，浏览器只拿 attemptId。
+ * device_code 能换出应用凭据，它不该出现在浏览器里。
+ */
+const REGISTRATIONS = new Map();
+const REGISTRATION_MAX = 20;
+function newAttemptId() {
+    return `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 10)}`;
+}
+function sweepRegistrations() {
+    const now = Date.now();
+    for (const [id, item] of REGISTRATIONS) {
+        if (item.expiresAt <= now)
+            REGISTRATIONS.delete(id);
+    }
+    while (REGISTRATIONS.size > REGISTRATION_MAX) {
+        const oldest = REGISTRATIONS.keys().next().value;
+        if (oldest === undefined)
+            break;
+        REGISTRATIONS.delete(oldest);
+    }
+}
+async function registrationRequest(origin, form) {
+    const result = await httpJson(`${origin}${REGISTRATION_PATH}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: new URLSearchParams(form).toString(),
+    });
+    return result.json;
+}
+/**
+ * 设备授权走 **accounts** 域名，不是 open-apis 的 open.feishu.cn ——
+ * 打到 open.feishu.cn 会 404。实测 `accounts.feishu.cn/oauth/v1/app/registration`
+ * 的 begin 返回：
+ *   verification_uri_complete=https://open.feishu.cn/page/launcher?user_code=XXXX-XXXX
+ *   expires_in=3600, interval=5
+ */
+function registrationOrigin(values) {
+    const domain = (values.get('FEISHU_DOMAIN') ?? values.get('LARK_DOMAIN') ?? '')
+        .trim()
+        .toLowerCase();
+    return domain.includes('larksuite')
+        ? 'https://accounts.larksuite.com'
+        : 'https://accounts.feishu.cn';
+}
+async function runRegisterBegin(ctx, targets) {
+    const env = readEnvSnapshot(targets.envPath);
+    const origin = registrationOrigin(env.values);
+    sweepRegistrations();
+    const json = await registrationRequest(origin, {
+        action: 'begin',
+        archetype: 'PersonalAgent',
+        auth_method: 'client_secret',
+        request_user_info: 'open_id',
+    });
+    if (json === null) {
+        return { ok: false, op: 'register-begin', error: '飞书没返回 JSON（网络或域名问题）' };
+    }
+    const err = asString(json['error']);
+    const url = asString(json['verification_uri_complete']);
+    const deviceCode = asString(json['device_code']);
+    if (err !== null || url === null || deviceCode === null) {
+        return {
+            ok: false,
+            op: 'register-begin',
+            error: '开始扫码失败：' +
+                (err ?? asString(json['error_description']) ?? '飞书没给二维码地址'),
+        };
+    }
+    const expireIn = asNumber(json['expires_in']) ?? 300;
+    const interval = asNumber(json['interval']) ?? 2;
+    const attemptId = newAttemptId();
+    REGISTRATIONS.set(attemptId, {
+        deviceCode,
+        origin,
+        expiresAt: Date.now() + expireIn * 1000,
+    });
+    let svg = '';
+    try {
+        svg = await QRCode.toString(url, {
+            type: 'svg',
+            margin: 1,
+            // 必须和设置页里 .qrImg 的 width 一致：SVG 自带固定 px 尺寸，比容器大就会溢出盖住文字。
+            width: 168,
+            errorCorrectionLevel: 'M',
+            color: { dark: '#000000', light: '#ffffff' },
+        });
+    }
+    catch (error) {
+        ctx.logger.warn?.('[dsh-feishu] 二维码生成失败：%s', String(error));
+    }
+    ctx.logger.info('[dsh-feishu] register-begin attempt=%s expire=%ss', attemptId, expireIn);
+    return {
+        ok: true,
+        op: 'register-begin',
+        attemptId,
+        qrUrl: url,
+        qrSvg: svg,
+        expireInSeconds: expireIn,
+        pollIntervalSeconds: interval,
+        message: svg === '' ? '二维码渲染失败，可以直接打开 qrUrl。' : null,
+    };
+}
+async function runRegisterPoll(ctx, body, targets) {
+    const attemptId = pickString(body, 'attemptId');
+    if (attemptId === null)
+        return { ok: false, op: 'register-poll', error: '缺 attemptId' };
+    const pending = REGISTRATIONS.get(attemptId);
+    if (pending === undefined) {
+        return { ok: true, op: 'register-poll', state: 'expired', error: '这次扫码已失效，重新生成二维码。' };
+    }
+    if (pending.expiresAt <= Date.now()) {
+        REGISTRATIONS.delete(attemptId);
+        return { ok: true, op: 'register-poll', state: 'expired', error: '二维码已过期，重新生成。' };
+    }
+    const json = await registrationRequest(pending.origin, {
+        action: 'poll',
+        device_code: pending.deviceCode,
+    });
+    // 网络抖动时当作「还没好」，不打断用户手上的扫码。
+    if (json === null)
+        return { ok: true, op: 'register-poll', state: 'pending' };
+    const err = asString(json['error']);
+    if (err === null || err === 'authorization_pending') {
+        return { ok: true, op: 'register-poll', state: 'pending' };
+    }
+    if (err === 'slow_down') {
+        return { ok: true, op: 'register-poll', state: 'slow_down', message: '飞书要求放慢轮询' };
+    }
+    if (err === 'expired_token') {
+        REGISTRATIONS.delete(attemptId);
+        return { ok: true, op: 'register-poll', state: 'expired', error: '二维码已过期，重新生成。' };
+    }
+    if (err === 'access_denied') {
+        REGISTRATIONS.delete(attemptId);
+        return { ok: true, op: 'register-poll', state: 'denied', error: '你在手机上取消了这次创建。' };
+    }
+    const appId = asString(json['client_id']);
+    const appSecret = asString(json['client_secret']);
+    if (appId === null || appSecret === null) {
+        REGISTRATIONS.delete(attemptId);
+        return {
+            ok: false,
+            op: 'register-poll',
+            state: 'error',
+            error: `飞书返回了意料之外的响应：${err ?? '(既没 error 也没凭据)'}`,
+        };
+    }
+    // 凭据只落本机文件、不回传浏览器：前端只需要知道应用建好了。
+    const env = readEnvSnapshot(targets.envPath);
+    const next = new Map(env.values);
+    next.set('FEISHU_APP_ID', appId);
+    next.set('FEISHU_APP_SECRET', appSecret);
+    atomicWriteFile(targets.envPath, renderEnvText(next), 0o600);
+    REGISTRATIONS.delete(attemptId);
+    ctx.logger.info('[dsh-feishu] 扫码创建应用成功 app_id=%s，凭据已写入 %s', appId, targets.envPath);
+    return {
+        ok: true,
+        op: 'register-poll',
+        state: 'succeeded',
+        appId,
+        secretTail: appSecret.slice(-4),
+        message: `已创建应用 ${appId}，凭据写进本机了。`,
+    };
+}
+/* ──────────────────────────── 向导 op ──────────────────────────── */
+async function runDiscoverChats(ctx, body, targets) {
+    const env = readEnvSnapshot(targets.envPath);
+    const credentials = credentialsForTest(body, env);
+    if (credentials.appId === null || credentials.appSecret === null) {
+        return {
+            ok: false,
+            op: 'discover-chats',
+            error: '先填 App ID 和 App Secret（至少保存过一次），再来扫描会话。',
+        };
+    }
+    const tokenResult = await fetchTenantToken(credentials.origin, credentials.appId, credentials.appSecret);
+    if (!tokenResult.ok) {
+        return {
+            ok: false,
+            op: 'discover-chats',
+            stage: 'credentials',
+            error: `凭据无效：code=${tokenResult.code ?? '未知'} msg=${tokenResult.msg}`,
+            feishu: { code: tokenResult.code, msg: tokenResult.msg },
+        };
+    }
+    const listed = await listBotChats(credentials.origin, tokenResult.value.token);
+    if (!listed.ok) {
+        const missing = listed.code !== null && SCOPE_ERROR_CODES.has(listed.code);
+        return {
+            ok: false,
+            op: 'discover-chats',
+            stage: 'list',
+            error: `列会话失败：code=${listed.code ?? '未知'} msg=${listed.msg ?? ''}`,
+            feishu: { code: listed.code, msg: listed.msg },
+            scope: missing ? 'im:chat:readonly' : null,
+        };
+    }
+    ctx.logger.info('[dsh-feishu] discover-chats → %d 个会话', listed.chats.length);
+    return {
+        ok: true,
+        op: 'discover-chats',
+        chats: listed.chats,
+        hasMore: listed.hasMore,
+        current: credentials.chatId,
+        message: listed.chats.length === 0
+            ? '这个机器人还没被拉进任何群：先在飞书里把它拉进一个群，再点「重新扫描」。'
+            : `找到 ${listed.chats.length} 个会话。`,
+    };
+}
+async function runSelfTest(ctx, body, config, targets) {
+    const env = readEnvSnapshot(targets.envPath);
+    const credentials = credentialsForTest(body, env);
+    const checks = [];
+    // ① 凭据文件（本地）
+    if (!env.exists) {
+        checks.push(checkItem('env', '凭据文件', 'fail', `还没有 ${targets.envPath}：先保存一次凭据`));
+    }
+    else if (env.appId === null || !env.hasSecret) {
+        checks.push(checkItem('env', '凭据文件', 'fail', '文件在，但缺 App ID 或 App Secret'));
+    }
+    else {
+        checks.push(checkItem('env', '凭据文件', 'pass', `secret 末四位 ${env.secretTail ?? '????'} · ${env.path}`));
+    }
+    // ② MCP 挂载（本地）
+    const resolved = resolveProfile(config, targets);
+    const patchPath = resolved.dir === null ? null : path.join(resolved.dir, 'cordis.patch.yml');
+    const patch = patchPath === null
+        ? { path: '', exists: false, hasBlock: false, mcpMounted: false }
+        : readPatchSnapshot(patchPath);
+    checks.push(patch.mcpMounted
+        ? checkItem('patch', 'MCP 已挂载', 'pass', patchPath ?? '')
+        : checkItem('patch', 'MCP 已挂载', 'fail', patchPath === null
+            ? '探测不到 profile：patch 路径未知'
+            : '还没写进 cordis.patch.yml（点「保存并启用」会自动补）'));
+    const skipRemaining = (from, reason) => {
+        for (let i = from; i < REMAINING_LABELS.length; i += 1) {
+            const label = REMAINING_LABELS[i];
+            if (label !== undefined)
+                checks.push(checkItem(`skip-${i}`, label, 'skip', reason));
+        }
+    };
+    if (credentials.appId === null || credentials.appSecret === null) {
+        checks.push(checkItem('token', '应用凭据', 'skip', '缺 App ID / App Secret'));
+        skipRemaining(0, '凭据不全，跳过');
+        return selfTestSummary(checks, 'cheart');
+    }
+    const tokenResult = await fetchTenantToken(credentials.origin, credentials.appId, credentials.appSecret);
+    if (!tokenResult.ok) {
+        checks.push(checkItem('token', '应用凭据', 'fail', `code=${tokenResult.code ?? '未知'} ${tokenResult.msg}（App ID / Secret 抄错，或应用被停用）`));
+        skipRemaining(0, '凭据无效，后续检查跳过');
+        return selfTestSummary(checks, 'slip');
+    }
+    const token = tokenResult.value.token;
+    checks.push(checkItem('token', '应用凭据', 'pass', `tenant_access_token 有效，${tokenResult.value.expire ?? '?'} 秒后过期`));
+    // ③ 机器人身份
+    const bot = await probeBotInfo(credentials.origin, token);
+    checks.push(bot.ok
+        ? checkItem('bot', '机器人身份', 'pass', bot.extra === null ? null : `应用名「${bot.extra}」`)
+        : checkItem('bot', '机器人身份', 'fail', `code=${bot.code ?? '未知'} ${bot.msg ?? ''}`, 'im:chat:readonly'));
+    // ④ 会话列表
+    const chats = await listBotChats(credentials.origin, token);
+    checks.push(chats.ok
+        ? checkItem('chats', '会话列表', 'pass', chats.chats.length === 0 ? '能读列表，但机器人还没进任何群' : `可见 ${chats.chats.length} 个会话`)
+        : checkItem('chats', '会话列表', 'fail', `code=${chats.code ?? '未知'} ${chats.msg ?? ''}`, 'im:chat:readonly'));
+    const chatId = credentials.chatId;
+    // ⑤ 目标会话
+    if (chatId === null) {
+        checks.push(checkItem('chat', '目标会话', 'skip', '还没选默认会话（第 3 步）'));
+    }
+    else {
+        const detail = await fetchChatName(credentials.origin, token, chatId);
+        checks.push(detail.ok
+            ? checkItem('chat', '目标会话', 'pass', `「${detail.name ?? '(无名)'}」`)
+            : checkItem('chat', '目标会话', 'fail', `code=${detail.code ?? '未知'} ${detail.msg ?? ''}`, detail.code === 230027 || detail.code === 230001 ? 'im:chat:readonly' : null));
+    }
+    // ⑥ 读聊天记录（零骚扰：只读一行，不发任何消息）
+    if (chatId === null) {
+        checks.push(checkItem('history', '读聊天记录', 'skip', '需要先选默认会话'));
+    }
+    else {
+        const history = await probeChatHistory(credentials.origin, token, chatId);
+        checks.push(history.ok
+            ? checkItem('history', '读聊天记录', 'pass', history.extra)
+            : checkItem('history', '读聊天记录', 'fail', `code=${history.code ?? '未知'} ${history.msg ?? ''}`, 'im:message.group_msg'));
+    }
+    // ⑦ 上传文件（上传后不发送，聊天里无痕）
+    const upload = await probeFileUpload(credentials.origin, token);
+    checks.push(upload.ok
+        ? checkItem('upload', '上传文件', 'pass', upload.extra)
+        : checkItem('upload', '上传文件', 'fail', `code=${upload.code ?? '未知'} ${upload.msg ?? ''}`, 'im:resource'));
+    // ⑧ 云空间
+    const drive = await probeDrive(credentials.origin, token);
+    checks.push(drive.ok
+        ? checkItem('drive', '云空间', 'pass', drive.extra)
+        : checkItem('drive', '云空间', 'fail', `code=${drive.code ?? '未知'} ${drive.msg ?? ''}`, 'drive:drive'));
+    ctx.logger.info('[dsh-feishu] self-test → %d 通过 / %d 失败', checks.filter((item) => item.status === 'pass').length, checks.filter((item) => item.status === 'fail').length);
+    return selfTestSummary(checks, 'done');
+}
+const REMAINING_LABELS = ['机器人身份', '会话列表', '目标会话', '读聊天记录', '上传文件', '云空间'];
+function selfTestSummary(checks, stage) {
+    const passed = checks.filter((item) => item.status === 'pass').length;
+    const failed = checks.filter((item) => item.status === 'fail').length;
+    const skipped = checks.filter((item) => item.status === 'skip').length;
+    const scopes = [];
+    for (const item of checks) {
+        if (item.status === 'fail' && item.scope !== null && !scopes.includes(item.scope)) {
+            scopes.push(item.scope);
+        }
+    }
+    return {
+        ok: failed === 0,
+        op: 'self-test',
+        stage,
+        checks,
+        passed,
+        failed,
+        skipped,
+        scopes,
+        message: failed === 0
+            ? skipped === 0
+                ? '全部通过，可以开始用了。'
+                : `通过（${skipped} 项跳过）。`
+            : `${failed} 项没通过，按每项的提示处理后重试。`,
+    };
+}
+/* ──────────────────────────── 插件入口 ──────────────────────────── */
+export function apply(ctx, config) {
+    const effective = config ?? {};
+    const configuredPath = effective.endpointPath;
+    const routePath = typeof configuredPath === 'string' && configuredPath.startsWith('/') ? configuredPath : DEFAULT_PATH;
+    const targets = resolveTargets(effective);
+    ctx.logger.info('[dsh-feishu] enabled; HTTP route = %s', routePath);
+    ctx.logger.info('[dsh-feishu] 凭据文件 = %s', targets.envPath);
+    ctx.effect(() => ctx.webServer.register({
+        kind: 'exact',
+        path: routePath,
+        handler: async (req, res) => {
+            if (req.method !== 'POST') {
+                sendJson(res, 405, { ok: false, error: '只接受 POST' });
+                return;
+            }
+            if (!trustedOrigin(req)) {
+                sendJson(res, 403, { ok: false, error: '跨源请求被拒绝' });
+                return;
+            }
+            try {
+                const body = await readJson(req);
+                const op = typeof body['op'] === 'string' ? body['op'] : '';
+                ctx.logger.info('[dsh-feishu] op = %s', op === '' ? '(none)' : op);
+                if (op === 'status') {
+                    sendJson(res, 200, statusReport(effective, targets));
+                    return;
+                }
+                if (op === 'test') {
+                    sendJson(res, 200, await runTest(ctx, body, targets));
+                    return;
+                }
+                if (op === 'save') {
+                    sendJson(res, 200, await runSave(ctx, body, effective, targets));
+                    return;
+                }
+                if (op === 'discover-chats') {
+                    sendJson(res, 200, await runDiscoverChats(ctx, body, targets));
+                    return;
+                }
+                if (op === 'self-test') {
+                    sendJson(res, 200, await runSelfTest(ctx, body, effective, targets));
+                    return;
+                }
+                if (op === 'register-begin') {
+                    sendJson(res, 200, await runRegisterBegin(ctx, targets));
+                    return;
+                }
+                if (op === 'register-poll') {
+                    sendJson(res, 200, await runRegisterPoll(ctx, body, targets));
+                    return;
+                }
+                throw new ApiError(400, `未知 op：${op === '' ? '(空)' : op}（支持 status / test / save / discover-chats / self-test / register-begin / register-poll）`);
+            }
+            catch (error) {
+                const status = error instanceof ApiError ? error.status : 500;
+                const message = error instanceof Error ? error.message : String(error);
+                if (status >= 500)
+                    ctx.logger.warn?.('[dsh-feishu] %s', message);
+                sendJson(res, status, { ok: false, error: message });
+            }
+        },
+    }), 'dsh-feishu: http route');
+}
+/** 具名 + default 两种导出都给：Loader 两种写法都能吃。 */
+export default { name, inject, apply };
+//# sourceMappingURL=index.js.map
