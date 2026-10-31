@@ -1,4 +1,4 @@
-# @dsh-feishu/dsh-plugin
+# @dshfeishu/plugin
 
 DeepSeek Harness 设置面板里的「飞书连接」页：四步向导，把飞书接进 DSH。
 

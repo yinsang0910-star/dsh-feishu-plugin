@@ -1,5 +1,5 @@
 {
-  "name": "@dsh-feishu/dsh-plugin",
+  "name": "@dshfeishu/plugin",
   "version": "0.1.0",
   "type": "module",
   "description": "DeepSeek Harness 的飞书连接设置页：四步向导 + 扫码创建应用 + 九项自检",
